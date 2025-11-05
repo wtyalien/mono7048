@@ -406,103 +406,30 @@ class DilatedConv(nn.Module):
 #         return x
 
 # v1.4
-# class LGFI(nn.Module):
-#     """
-#     Local-Global Feature Interaction with MCA (纯 4D 版)
-#     - 位置编码直接加在 (B,C,H,W)
-#     - 通道归一化用 channels_first
-#     - gamma 正确广播到 (1,C,1,1)
-#     - Inverted Bottleneck 仍走 channels_last 分支
-#     """
-#     def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6, expan_ratio=6,
-#                  use_pos_emb=True, num_heads=6, qkv_bias=True, attn_drop=0., drop=0.):
-#         super().__init__()
-#         self.dim = dim
-
-#         # 位置编码：(B,C,H,W)
-#         self.pos_embd = PositionalEncodingFourier(dim=self.dim) if use_pos_emb else None
-
-#         # 4D 注意力分支
-#         self.norm_mca = LayerNorm(self.dim, eps=1e-6, data_format="channels_first")
-#         self.gamma_mca = nn.Parameter(layer_scale_init_value * torch.ones(self.dim),
-#                                       requires_grad=True) if layer_scale_init_value > 0 else None
-#         self.mca = MCA(dim=dim)
-
-#         # Inverted Bottleneck（channels_last）
-#         self.norm = LayerNorm(self.dim, eps=1e-6)   # channels_last
-#         self.pwconv1 = nn.Linear(self.dim, expan_ratio * self.dim)
-#         self.act = nn.GELU()
-#         self.pwconv2 = nn.Linear(expan_ratio * self.dim, self.dim)
-#         self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(self.dim),
-#                                   requires_grad=True) if layer_scale_init_value > 0 else None
-
-#         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
-#     def forward(self, x):
-#         # x: (B,C,H,W)
-#         identity = x
-#         B, C, H, W = x.shape
-
-#         # 位置编码
-#         if self.pos_embd is not None:
-#             x = x + self.pos_embd(B, H, W)  # (B,C,H,W)
-
-#         # 4D 注意力
-#         x_norm = self.norm_mca(x)
-#         y = self.mca(x_norm)  # (B,C,H,W)
-#         # 形状强校验（正常不会触发）
-#         if y.shape != x.shape:
-#             raise RuntimeError(f"LGFI: MCA 输出 {y.shape} 与输入 {x.shape} 不一致")
-
-#         # 按通道维广播 gamma
-#         if self.gamma_mca is not None:
-#             x = x + self.gamma_mca.view(1, -1, 1, 1) * y
-#         else:
-#             x = x + y
-
-#         # Inverted Bottleneck（与原版一致）
-#         x = x.permute(0, 2, 3, 1)          # (B,C,H,W) -> (B,H,W,C)
-#         x = self.norm(x)
-#         x = self.pwconv1(x)
-#         x = self.act(x)
-#         x = self.pwconv2(x)
-#         if self.gamma is not None:
-#             x = self.gamma * x             # (B,H,W,C)，沿 C 广播
-#         x = x.permute(0, 3, 1, 2)          # (B,H,W,C) -> (B,C,H,W)
-
-#         # 残差
-#         x = identity + self.drop_path(x)
-#         return x
-# v1.4.5  XCA长程为主，轻量化MCA（不含空间通道等）局部为辅
 class LGFI(nn.Module):
     """
-    最终混合方案：XCA(全局) + MCA(局部增强)
-    关键：XCA为主，MCA为辅
+    Local-Global Feature Interaction with MCA (纯 4D 版)
+    - 位置编码直接加在 (B,C,H,W)
+    - 通道归一化用 channels_first
+    - gamma 正确广播到 (1,C,1,1)
+    - Inverted Bottleneck 仍走 channels_last 分支
     """
     def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6, expan_ratio=6,
                  use_pos_emb=True, num_heads=6, qkv_bias=True, attn_drop=0., drop=0.):
         super().__init__()
         self.dim = dim
 
-        # ===== 位置编码 =====
+        # 位置编码：(B,C,H,W)
         self.pos_embd = PositionalEncodingFourier(dim=self.dim) if use_pos_emb else None
 
-        # ===== 主分支：XCA（保留原版全局能力） =====
-        self.norm_xca = LayerNorm(self.dim, eps=1e-6)
-        self.gamma_xca = nn.Parameter(layer_scale_init_value * torch.ones(self.dim),
-                                      requires_grad=True) if layer_scale_init_value > 0 else None
-        self.xca = XCA(self.dim, num_heads=num_heads, qkv_bias=qkv_bias, 
-                       attn_drop=attn_drop, proj_drop=drop)
-
-        # ===== 辅助分支：轻量MCA（仅增强局部细节） =====
+        # 4D 注意力分支
         self.norm_mca = LayerNorm(self.dim, eps=1e-6, data_format="channels_first")
-        self.gamma_mca = nn.Parameter(0.5 * layer_scale_init_value * torch.ones(self.dim),
+        self.gamma_mca = nn.Parameter(layer_scale_init_value * torch.ones(self.dim),
                                       requires_grad=True) if layer_scale_init_value > 0 else None
-        # 关键：轻量MCA（无空间分支，降低计算量）
-        self.mca_light = MCALayer(channels=dim, no_spatial=True)  # 仅h_cw + w_hc
+        self.mca = MCA(dim=dim)
 
-        # ===== Inverted Bottleneck =====
-        self.norm = LayerNorm(self.dim, eps=1e-6)
+        # Inverted Bottleneck（channels_last）
+        self.norm = LayerNorm(self.dim, eps=1e-6)   # channels_last
         self.pwconv1 = nn.Linear(self.dim, expan_ratio * self.dim)
         self.act = nn.GELU()
         self.pwconv2 = nn.Linear(expan_ratio * self.dim, self.dim)
@@ -512,37 +439,110 @@ class LGFI(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
+        # x: (B,C,H,W)
         identity = x
         B, C, H, W = x.shape
 
-        # ===== 位置编码（3D，与原版一致） =====
-        x_flat = x.reshape(B, C, H * W).permute(0, 2, 1)
+        # 位置编码
         if self.pos_embd is not None:
-            pos_encoding = self.pos_embd(B, H, W).reshape(B, -1, x_flat.shape[1]).permute(0, 2, 1)
-            x_flat = x_flat + pos_encoding
+            x = x + self.pos_embd(B, H, W)  # (B,C,H,W)
 
-        # ===== 主分支：XCA全局注意力 =====
-        x_flat = x_flat + self.gamma_xca * self.xca(self.norm_xca(x_flat))
-        x = x_flat.reshape(B, H, W, C).permute(0, 3, 1, 2)  # 转回4D
+        # 4D 注意力
+        x_norm = self.norm_mca(x)
+        y = self.mca(x_norm)  # (B,C,H,W)
+        # 形状强校验（正常不会触发）
+        if y.shape != x.shape:
+            raise RuntimeError(f"LGFI: MCA 输出 {y.shape} 与输入 {x.shape} 不一致")
 
-        # ===== 辅助分支：MCA局部增强（权重减半） =====
-        x_mca_norm = self.norm_mca(x)
-        x_mca_out = self.mca_light(x_mca_norm)
+        # 按通道维广播 gamma
         if self.gamma_mca is not None:
-            x = x + self.gamma_mca.view(1, -1, 1, 1) * x_mca_out
+            x = x + self.gamma_mca.view(1, -1, 1, 1) * y
+        else:
+            x = x + y
 
-        # ===== Inverted Bottleneck =====
-        x = x.permute(0, 2, 3, 1)
+        # Inverted Bottleneck（与原版一致）
+        x = x.permute(0, 2, 3, 1)          # (B,C,H,W) -> (B,H,W,C)
         x = self.norm(x)
         x = self.pwconv1(x)
         x = self.act(x)
         x = self.pwconv2(x)
         if self.gamma is not None:
-            x = self.gamma * x
-        x = x.permute(0, 3, 1, 2)
+            x = self.gamma * x             # (B,H,W,C)，沿 C 广播
+        x = x.permute(0, 3, 1, 2)          # (B,H,W,C) -> (B,C,H,W)
 
+        # 残差
         x = identity + self.drop_path(x)
         return x
+# v1.4.5  XCA长程为主，轻量化MCA（不含空间通道等）局部为辅
+# class LGFI(nn.Module):
+#     """
+#     最终混合方案：XCA(全局) + MCA(局部增强)
+#     关键：XCA为主，MCA为辅
+#     """
+#     def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6, expan_ratio=6,
+#                  use_pos_emb=True, num_heads=6, qkv_bias=True, attn_drop=0., drop=0.):
+#         super().__init__()
+#         self.dim = dim
+
+#         # ===== 位置编码 =====
+#         self.pos_embd = PositionalEncodingFourier(dim=self.dim) if use_pos_emb else None
+
+#         # ===== 主分支：XCA（保留原版全局能力） =====
+#         self.norm_xca = LayerNorm(self.dim, eps=1e-6)
+#         self.gamma_xca = nn.Parameter(layer_scale_init_value * torch.ones(self.dim),
+#                                       requires_grad=True) if layer_scale_init_value > 0 else None
+#         self.xca = XCA(self.dim, num_heads=num_heads, qkv_bias=qkv_bias, 
+#                        attn_drop=attn_drop, proj_drop=drop)
+
+#         # ===== 辅助分支：轻量MCA（仅增强局部细节） =====
+#         self.norm_mca = LayerNorm(self.dim, eps=1e-6, data_format="channels_first")
+#         self.gamma_mca = nn.Parameter(0.5 * layer_scale_init_value * torch.ones(self.dim),
+#                                       requires_grad=True) if layer_scale_init_value > 0 else None
+#         # 关键：轻量MCA（无空间分支，降低计算量）
+#         self.mca_light = MCALayer(channels=dim, no_spatial=True)  # 仅h_cw + w_hc
+
+#         # ===== Inverted Bottleneck =====
+#         self.norm = LayerNorm(self.dim, eps=1e-6)
+#         self.pwconv1 = nn.Linear(self.dim, expan_ratio * self.dim)
+#         self.act = nn.GELU()
+#         self.pwconv2 = nn.Linear(expan_ratio * self.dim, self.dim)
+#         self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(self.dim),
+#                                   requires_grad=True) if layer_scale_init_value > 0 else None
+
+#         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+#     def forward(self, x):
+#         identity = x
+#         B, C, H, W = x.shape
+
+#         # ===== 位置编码（3D，与原版一致） =====
+#         x_flat = x.reshape(B, C, H * W).permute(0, 2, 1)
+#         if self.pos_embd is not None:
+#             pos_encoding = self.pos_embd(B, H, W).reshape(B, -1, x_flat.shape[1]).permute(0, 2, 1)
+#             x_flat = x_flat + pos_encoding
+
+#         # ===== 主分支：XCA全局注意力 =====
+#         x_flat = x_flat + self.gamma_xca * self.xca(self.norm_xca(x_flat))
+#         x = x_flat.reshape(B, H, W, C).permute(0, 3, 1, 2)  # 转回4D
+
+#         # ===== 辅助分支：MCA局部增强（权重减半） =====
+#         x_mca_norm = self.norm_mca(x)
+#         x_mca_out = self.mca_light(x_mca_norm)
+#         if self.gamma_mca is not None:
+#             x = x + self.gamma_mca.view(1, -1, 1, 1) * x_mca_out
+
+#         # ===== Inverted Bottleneck =====
+#         x = x.permute(0, 2, 3, 1)
+#         x = self.norm(x)
+#         x = self.pwconv1(x)
+#         x = self.act(x)
+#         x = self.pwconv2(x)
+#         if self.gamma is not None:
+#             x = self.gamma * x
+#         x = x.permute(0, 3, 1, 2)
+
+#         x = identity + self.drop_path(x)
+#         return x
 # # v3.6,并行MCA,XCA
 # class LGFI(nn.Module):
 #     """自适应融合：网络自学习MCA和XCA的最佳比例"""
