@@ -243,7 +243,9 @@ class LiteMonoOptions:
                                  type=float,
                                  default=0.1,  # 改为0.1适配30轮训练
                                  help="diffusion loss weight")
-          
+        self.parser.add_argument("--strong_aug",
+                                 help="if set, uses strong data augmentation",
+                                 action="store_true")
     def parse(self):
         self.options = self.parser.parse_args()
         return self.options

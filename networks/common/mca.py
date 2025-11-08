@@ -543,6 +543,291 @@ class MCA(nn.Module):
             raise RuntimeError(f"MCA 输出形状 {y.shape} 与输入 {x.shape} 不一致")
         return y
 
+# v14.7
+# import math
+# import torch
+# from torch import nn
+
+# __all__ = ["MCAGate", "MCALayer", "MCA"]
+
+# class StdPool(nn.Module):
+#     def forward(self, x):
+#         b, c, h, w = x.size()
+#         std = x.view(b, c, -1).std(dim=2, keepdim=True)
+#         return std.view(b, c, 1, 1)
+
+# class MCAGate(nn.Module):
+#     def __init__(self, k_size: int, pool_types=('avg', 'std'), dropout_p=0.05):  # ← 降低到0.05
+#         super().__init__()
+#         assert k_size >= 3 and k_size % 2 == 1
+#         self.pools = nn.ModuleList()
+#         for p in pool_types:
+#             if p == "avg":
+#                 self.pools.append(nn.AdaptiveAvgPool2d(1))
+#             elif p == "std":
+#                 self.pools.append(StdPool())
+#             else:
+#                 raise NotImplementedError
+
+#         self.conv = nn.Conv2d(1, 1, kernel_size=(1, k_size),
+#                               stride=1, padding=(0, (k_size - 1) // 2), bias=False)
+#         self.sigmoid = nn.Sigmoid()
+#         self.dropout = nn.Dropout(dropout_p)
+#         self.weight = nn.Parameter(torch.zeros(len(pool_types)))
+
+#     def forward(self, x):
+#         feats = [pool(x) for pool in self.pools]
+#         w = torch.sigmoid(self.weight)
+#         base = sum(w[i] * feats[i] for i in range(len(feats)))
+
+#         if len(feats) == 2:
+#             base = 0.5 * (feats[0] + feats[1]) + w[0] * feats[0] + w[1] * feats[1]
+
+#         y = base.permute(0, 3, 2, 1).contiguous()
+#         y = self.conv(y)
+#         y = self.dropout(y)
+#         y = y.permute(0, 3, 2, 1).contiguous()
+#         y = self.sigmoid(y)
+#         return x * y.expand_as(x)
+
+# class MCALayer(nn.Module):
+#     def __init__(self, channels: int, no_spatial: bool = False, drop_path=0.0):  # ← 关键:改为0
+#         super().__init__()
+#         lambd, gamma = 1.5, 1.0
+#         temp = int(round(abs((math.log2(max(channels, 2)) - gamma) / lambd)))
+#         k_spatial = max(3, temp if temp % 2 == 1 else temp + 1)
+
+#         self.h_cw = MCAGate(3, dropout_p=0.05)
+#         self.w_hc = MCAGate(3, dropout_p=0.05)
+#         self.no_spatial = no_spatial
+#         if not no_spatial:
+#             self.c_hw = MCAGate(k_spatial, dropout_p=0.05)
+
+#         # ===== 关键修复:DropPath应该从外部传入 =====
+#         self.norm = nn.LayerNorm(channels)
+#         self.layer_scale = nn.Parameter(1e-5 * torch.ones(channels))  # ← 改大到1e-5
+#         self.drop_path = nn.Dropout(drop_path) if drop_path > 0 else nn.Identity()
+
+#     def forward(self, x):
+#         shortcut = x
+#         x_h = x.permute(0, 2, 1, 3).contiguous()
+#         x_h = self.h_cw(x_h)
+#         x_h = x_h.permute(0, 2, 1, 3).contiguous()
+
+#         x_w = x.permute(0, 3, 2, 1).contiguous()
+#         x_w = self.w_hc(x_w)
+#         x_w = x_w.permute(0, 3, 2, 1).contiguous()
+
+#         if not self.no_spatial:
+#             x_c = self.c_hw(x)
+#             out = (x_c + x_h + x_w) / 3.0
+#         else:
+#             out = (x_h + x_w) / 2.0
+
+#         # ===== 修复:DropPath位置 =====
+#         out = self.layer_scale.view(1, -1, 1, 1) * out
+#         out = self.drop_path(out)  # ← 移到这里
+#         out = out + shortcut
+#         out = self.norm(out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+#         return out
+
+# class MCA(nn.Module):
+#     def __init__(self, dim: int, drop_path=0.0, **kwargs):  # ← 接收drop_path
+#         super().__init__()
+#         self.layer = MCALayer(channels=dim, no_spatial=False, drop_path=drop_path)
+
+#     def forward(self, x):
+#         assert x.dim() == 4
+#         y = self.layer(x)
+#         if y.shape != x.shape:
+#             raise RuntimeError(f"MCA 输出形状 {y.shape} 与输入 {x.shape} 不一致")
+#         return y
+
+# # v1.8
+# # networks/common/mca.py 完整替换
+# """
+# MCA v2.0: 双路径设计
+# - 主路径: MCA(局部快速)
+# - 辅路径: 轻量全局注意力(补充长程依赖)
+# """
+# import math
+# import torch
+# from torch import nn
+# import torch.nn.functional as F
+
+# __all__ = ["MCAGate", "MCALayer", "MCA"]
+
+# class StdPool(nn.Module):
+#     def forward(self, x):
+#         b, c, h, w = x.size()
+#         std = x.view(b, c, -1).std(dim=2, keepdim=True)
+#         return std.view(b, c, 1, 1)
+
+
+# class MCAGate(nn.Module):
+#     def __init__(self, k_size: int, pool_types=('avg', 'std'), dropout_p=0.1):
+#         super().__init__()
+#         assert k_size >= 3 and k_size % 2 == 1
+#         self.pools = nn.ModuleList()
+#         for p in pool_types:
+#             if p == "avg":
+#                 self.pools.append(nn.AdaptiveAvgPool2d(1))
+#             elif p == "std":
+#                 self.pools.append(StdPool())
+#             else:
+#                 raise NotImplementedError
+
+#         self.conv = nn.Conv2d(1, 1, kernel_size=(1, k_size),
+#                               stride=1, padding=(0, (k_size - 1) // 2), bias=False)
+#         self.sigmoid = nn.Sigmoid()
+#         self.dropout = nn.Dropout(dropout_p)
+#         self.weight = nn.Parameter(torch.zeros(len(pool_types)))
+
+#     def forward(self, x):
+#         feats = [pool(x) for pool in self.pools]
+#         w = torch.sigmoid(self.weight)
+#         base = sum(w[i] * feats[i] for i in range(len(feats)))
+
+#         if len(feats) == 2:
+#             base = 0.5 * (feats[0] + feats[1]) + w[0] * feats[0] + w[1] * feats[1]
+
+#         y = base.permute(0, 3, 2, 1).contiguous()
+#         y = self.conv(y)
+#         y = self.dropout(y)
+#         y = y.permute(0, 3, 2, 1).contiguous()
+#         y = self.sigmoid(y)
+#         return x * y.expand_as(x)
+
+
+# # ===== 新增:轻量全局注意力 =====
+# class LightGlobalAttention(nn.Module):
+#     """
+#     极轻量的全局注意力 - 补充MCA的长程建模
+#     计算量: O(C*H*W/16) vs XCA的O(C*H*W*C)
+#     """
+#     def __init__(self, dim, num_heads=4):
+#         super().__init__()
+#         self.num_heads = num_heads
+#         self.head_dim = dim // num_heads
+#         self.scale = self.head_dim ** -0.5
+        
+#         # 空间降维(减少全局注意力计算量)
+#         self.sr_ratio = 4  # 降4倍分辨率
+#         self.sr = nn.Conv2d(dim, dim, kernel_size=self.sr_ratio, stride=self.sr_ratio)
+#         self.norm = nn.LayerNorm(dim)
+        
+#         # Q全分辨率, KV降采样
+#         self.q = nn.Linear(dim, dim, bias=False)
+#         self.kv = nn.Linear(dim, dim * 2, bias=False)
+#         self.proj = nn.Linear(dim, dim)
+        
+#     def forward(self, x):
+#         B, C, H, W = x.shape
+#         N = H * W
+        
+#         # Q: 全分辨率
+#         x_flat = x.flatten(2).transpose(1, 2)  # (B,N,C)
+#         q = self.q(x_flat).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        
+#         # KV: 降采样(关键:减少计算)
+#         x_sr = self.sr(x).flatten(2).transpose(1, 2)  # (B,N/16,C)
+#         x_sr = self.norm(x_sr)
+#         kv = self.kv(x_sr).reshape(B, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+#         k, v = kv[0], kv[1]
+        
+#         # 注意力
+#         attn = (q @ k.transpose(-2, -1)) * self.scale
+#         attn = attn.softmax(dim=-1)
+        
+#         out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+#         out = self.proj(out)
+        
+#         return out.transpose(1, 2).reshape(B, C, H, W)
+
+
+# class MCALayer(nn.Module):
+#     """
+#     v2.0: MCA(局部) + 轻量全局注意力(长程)
+#     关键:保留原版drop_path=0.1正则化
+#     """
+#     def __init__(self, channels: int, no_spatial: bool = False, 
+#                  drop_path=0.1, use_global=True):
+#         super().__init__()
+#         lambd, gamma = 1.5, 1.0
+#         temp = int(round(abs((math.log2(max(channels, 2)) - gamma) / lambd)))
+#         k_spatial = max(3, temp if temp % 2 == 1 else temp + 1)
+
+#         # MCA分支(保持原版配置)
+#         self.h_cw = MCAGate(3, dropout_p=0.1)
+#         self.w_hc = MCAGate(3, dropout_p=0.1)
+#         self.no_spatial = no_spatial
+#         if not no_spatial:
+#             self.c_hw = MCAGate(k_spatial, dropout_p=0.1)
+
+#         # ===== 新增:全局分支(轻量) =====
+#         self.use_global = use_global
+#         if use_global:
+#             self.global_attn = LightGlobalAttention(channels, num_heads=4)
+#             self.global_norm = nn.LayerNorm(channels)
+#             self.alpha = nn.Parameter(torch.tensor(0.2))  # 可学习混合比例
+
+#         # LayerNorm + LayerScale + DropPath(恢复原版)
+#         self.norm = nn.LayerNorm(channels)
+#         self.layer_scale = nn.Parameter(1e-6 * torch.ones(channels))
+#         self.drop_path = nn.Dropout(drop_path)
+
+#     def forward(self, x):
+#         shortcut = x
+        
+#         # MCA分支(局部)
+#         x_h = x.permute(0, 2, 1, 3).contiguous()
+#         x_h = self.h_cw(x_h)
+#         x_h = x_h.permute(0, 2, 1, 3).contiguous()
+
+#         x_w = x.permute(0, 3, 2, 1).contiguous()
+#         x_w = self.w_hc(x_w)
+#         x_w = x_w.permute(0, 3, 2, 1).contiguous()
+
+#         if not self.no_spatial:
+#             x_c = self.c_hw(x)
+#             mca_out = (x_c + x_h + x_w) / 3.0
+#         else:
+#             mca_out = (x_h + x_w) / 2.0
+
+#         # ===== 全局分支(长程) =====
+#         if self.use_global:
+#             B, C, H, W = x.shape
+#             x_norm = x.permute(0, 2, 3, 1)  # (B,H,W,C)
+#             x_norm = self.global_norm(x_norm).permute(0, 3, 1, 2)  # (B,C,H,W)
+#             global_out = self.global_attn(x_norm)
+            
+#             # 自适应混合
+#             alpha = torch.sigmoid(self.alpha)
+#             out = (1 - alpha) * mca_out + alpha * global_out
+#         else:
+#             out = mca_out
+
+#         # 残差 + LayerScale + DropPath
+#         out = self.drop_path(out)
+#         out = self.layer_scale.view(1, -1, 1, 1) * out
+#         out = out + shortcut
+#         out = self.norm(out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+#         return out
+
+
+# class MCA(nn.Module):
+#     """v2.0封装 - 支持全局分支"""
+#     def __init__(self, dim: int, use_global=True, **kwargs):
+#         super().__init__()
+#         self.layer = MCALayer(channels=dim, no_spatial=False, 
+#                               drop_path=0.1, use_global=use_global)
+
+#     def forward(self, x):
+#         assert x.dim() == 4
+#         y = self.layer(x)
+#         if y.shape != x.shape:
+#             raise RuntimeError(f"MCA输出形状{y.shape}与输入{x.shape}不一致")
+#         return y
 
 
 #v1.4.1 不如v1.4

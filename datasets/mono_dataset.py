@@ -4,6 +4,7 @@ import random
 import numpy as np
 import copy
 from PIL import Image  # using pillow-simd for increased speed
+from PIL import ImageEnhance, ImageFilter  # 🔹 新增增强库
 
 import torch
 import torch.utils.data as data
@@ -92,6 +93,48 @@ class MonoDataset(data.Dataset):
                 for i in range(self.num_scales):
                     inputs[(n, im, i)] = self.resize[i](inputs[(n, im, i - 1)])
 
+        # ======================================================
+        # 仅当 --strong_aug 被指定时才启用增强
+        # ======================================================
+        strong_aug = getattr(self, "opt", None)
+        strong_aug = getattr(strong_aug, "strong_aug", False)
+
+        if self.is_train and strong_aug:
+            for k in list(inputs):
+                if "color" in k:
+                    n, im, i = k
+                    img = inputs[(n, im, 0)]
+
+                    # ---- 颜色类增强 ----
+                    if random.random() > 0.5:
+                        img = ImageEnhance.Brightness(img).enhance(random.uniform(0.8, 1.2))
+                    if random.random() > 0.5:
+                        img = ImageEnhance.Contrast(img).enhance(random.uniform(0.8, 1.2))
+                    if random.random() > 0.5:
+                        img = ImageEnhance.Color(img).enhance(random.uniform(0.9, 1.1))
+                    if random.random() > 0.3:
+                        img = ImageEnhance.Sharpness(img).enhance(random.uniform(0.85, 1.15))
+                    if random.random() > 0.7:
+                        img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, 0.4)))
+
+                    # 更新所有尺度
+                    inputs[(n, im, 0)] = img
+                    for s in range(1, self.num_scales):
+                        inputs[(n, im, s)] = self.resize[s](img)
+
+            # ---- 随机水平翻转（图像 + 深度 + 内参）----
+            if random.random() > 0.5:
+                for k in list(inputs):
+                    if "color" in k or "depth" in k:
+                        for s in range(self.num_scales):
+                            if (k[0], k[1], s) in inputs:
+                                inputs[(k[0], k[1], s)] = inputs[(k[0], k[1], s)].transpose(Image.FLIP_LEFT_RIGHT)
+                for s in range(self.num_scales):
+                    if ("K", s) in inputs:
+                        K = inputs[("K", s)].copy()
+                        K[0, 2] = self.width // (2 ** s) - K[0, 2]
+                        inputs[("K", s)] = K
+        #↑ ======================================================
         for k in list(inputs):
             f = inputs[k]
             if "color" in k:
