@@ -3748,7 +3748,9 @@
 #             print("Cannot find Adam weights so Adam is randomly initialized")
 
 # # v1.4.2.5 == v1.4.2.4 +TTA ,只修改val函数
-# v3.0 = v1.4+扩散模型
+
+
+# v3.0 = v1.4+扩散模型,不加--diffusion参数则完全同原版
 
 """
 完整修正版 trainer.py - 集成扩散深度细化

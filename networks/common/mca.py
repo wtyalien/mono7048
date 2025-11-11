@@ -543,6 +543,184 @@ class MCA(nn.Module):
             raise RuntimeError(f"MCA 输出形状 {y.shape} 与输入 {x.shape} 不一致")
         return y
 
+# v1.9.7
+# networks/common/mca.py - 方案A: 多尺度MCA金字塔
+# """
+# MCA Multi-Scale Pyramid v2.0
+# 核心改进: 三尺度MCA并行 -> 隐式长程建模
+# 计算量: 比v1.4仅增加35%
+# """
+# import math
+# import torch
+# from torch import nn
+# import torch.nn.functional as F
+
+# __all__ = ["MCAGate", "MCALayer", "MCA"]
+
+# class StdPool(nn.Module):
+#     def forward(self, x):
+#         b, c, h, w = x.size()
+#         std = x.view(b, c, -1).std(dim=2, keepdim=True)
+#         return std.view(b, c, 1, 1)
+
+
+# class MCAGate(nn.Module):
+#     def __init__(self, k_size: int, pool_types=('avg', 'std'), dropout_p=0.1):
+#         super().__init__()
+#         assert k_size >= 3 and k_size % 2 == 1
+#         self.pools = nn.ModuleList()
+#         for p in pool_types:
+#             if p == "avg":
+#                 self.pools.append(nn.AdaptiveAvgPool2d(1))
+#             elif p == "std":
+#                 self.pools.append(StdPool())
+#             else:
+#                 raise NotImplementedError
+
+#         self.conv = nn.Conv2d(1, 1, kernel_size=(1, k_size),
+#                               stride=1, padding=(0, (k_size - 1) // 2), bias=False)
+#         self.sigmoid = nn.Sigmoid()
+#         self.dropout = nn.Dropout(dropout_p)
+#         self.weight = nn.Parameter(torch.zeros(len(pool_types)))
+
+#     def forward(self, x):
+#         feats = [pool(x) for pool in self.pools]
+#         w = torch.sigmoid(self.weight)
+#         base = sum(w[i] * feats[i] for i in range(len(feats)))
+
+#         if len(feats) == 2:
+#             base = 0.5 * (feats[0] + feats[1]) + w[0] * feats[0] + w[1] * feats[1]
+
+#         y = base.permute(0, 3, 2, 1).contiguous()
+#         y = self.conv(y)
+#         y = self.dropout(y)
+#         y = y.permute(0, 3, 2, 1).contiguous()
+#         y = self.sigmoid(y)
+#         return x * y.expand_as(x)
+
+
+# class MultiScaleMCALayer(nn.Module):
+#     """
+#     三尺度MCA并行架构:
+#     - Small (k=3): 局部细节 (原v1.4)
+#     - Medium (k=7): 中程依赖
+#     - Large (k=15): 远程关系 (关键改进)
+    
+#     自适应权重融合 -> 不同深度区域动态平衡
+#     """
+#     def __init__(self, channels: int, drop_path=0.1):
+#         super().__init__()
+        
+#         # === 三尺度MCA分支 (HW维度) ===
+#         self.mca_small = MCAGate(3, dropout_p=0.1)    # 原版局部
+#         self.mca_medium = MCAGate(7, dropout_p=0.1)   # 中程补充
+#         self.mca_large = MCAGate(15, dropout_p=0.1)   # 远程增强(核心)
+        
+#         # === CW维度 (保持原版) ===
+#         lambd, gamma = 1.5, 1.0
+#         temp = int(round(abs((math.log2(max(channels, 2)) - gamma) / lambd)))
+#         k_spatial = max(3, temp if temp % 2 == 1 else temp + 1)
+#         self.w_hc = MCAGate(3, dropout_p=0.1)
+#         self.c_hw = MCAGate(k_spatial, dropout_p=0.1)
+        
+#         # === 自适应融合权重(可学习) ===
+#         self.scale_weights = nn.Parameter(torch.ones(3) / 3)  # 初始均匀
+        
+#         # === 保持v1.4正则化 ===
+#         self.norm = nn.LayerNorm(channels)
+#         self.layer_scale = nn.Parameter(1e-6 * torch.ones(channels))
+#         self.drop_path = nn.Dropout(drop_path)
+
+#     def forward(self, x):
+#         shortcut = x
+        
+#         # === HW维: 三尺度并行 ===
+#         x_h = x.permute(0, 2, 1, 3).contiguous()  # (B,H,C,W)
+#         h_small = self.mca_small(x_h)
+#         h_medium = self.mca_medium(x_h)
+#         h_large = self.mca_large(x_h)
+        
+#         # 自适应加权 (Softmax保证和为1)
+#         w = F.softmax(self.scale_weights, dim=0)
+#         x_h_fused = w[0] * h_small + w[1] * h_medium + w[2] * h_large
+#         x_h_fused = x_h_fused.permute(0, 2, 1, 3).contiguous()
+        
+#         # === CW维 (保持原版) ===
+#         x_w = x.permute(0, 3, 2, 1).contiguous()  # (B,W,H,C)
+#         x_w = self.w_hc(x_w)
+#         x_w = x_w.permute(0, 3, 2, 1).contiguous()
+        
+#         # === C维 (保持原版) ===
+#         x_c = self.c_hw(x)
+        
+#         # === 三路融合 ===
+#         out = (x_h_fused + x_w + x_c) / 3.0
+        
+#         # === 残差 + LayerScale + DropPath + LayerNorm ===
+#         out = self.drop_path(out)
+#         out = self.layer_scale.view(1, -1, 1, 1) * out
+#         out = out + shortcut
+#         out = self.norm(out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+#         return out
+
+
+# class MCALayer(nn.Module):
+#     """v1.4原版(保持兼容性)"""
+#     def __init__(self, channels: int, no_spatial: bool = False, drop_path=0.1):
+#         super().__init__()
+#         lambd, gamma = 1.5, 1.0
+#         temp = int(round(abs((math.log2(max(channels, 2)) - gamma) / lambd)))
+#         k_spatial = max(3, temp if temp % 2 == 1 else temp + 1)
+
+#         self.h_cw = MCAGate(3, dropout_p=0.1)
+#         self.w_hc = MCAGate(3, dropout_p=0.1)
+#         self.no_spatial = no_spatial
+#         if not no_spatial:
+#             self.c_hw = MCAGate(k_spatial, dropout_p=0.1)
+
+#         self.norm = nn.LayerNorm(channels)
+#         self.layer_scale = nn.Parameter(1e-6 * torch.ones(channels))
+#         self.drop_path = nn.Dropout(drop_path)
+
+#     def forward(self, x):
+#         shortcut = x
+#         x_h = x.permute(0, 2, 1, 3).contiguous()
+#         x_h = self.h_cw(x_h)
+#         x_h = x_h.permute(0, 2, 1, 3).contiguous()
+
+#         x_w = x.permute(0, 3, 2, 1).contiguous()
+#         x_w = self.w_hc(x_w)
+#         x_w = x_w.permute(0, 3, 2, 1).contiguous()
+
+#         if not self.no_spatial:
+#             x_c = self.c_hw(x)
+#             out = (x_c + x_h + x_w) / 3.0
+#         else:
+#             out = (x_h + x_w) / 2.0
+
+#         out = self.drop_path(out)
+#         out = self.layer_scale.view(1, -1, 1, 1) * out
+#         out = out + shortcut
+#         out = self.norm(out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+#         return out
+
+
+# class MCA(nn.Module):
+#     """v2.0封装 - 多尺度版本"""
+#     def __init__(self, dim: int, use_multiscale=True, **kwargs):
+#         super().__init__()
+#         if use_multiscale:
+#             self.layer = MultiScaleMCALayer(channels=dim, drop_path=0.1)
+#         else:
+#             self.layer = MCALayer(channels=dim, no_spatial=False, drop_path=0.1)
+
+#     def forward(self, x):
+#         assert x.dim() == 4
+#         y = self.layer(x)
+#         if y.shape != x.shape:
+#             raise RuntimeError(f"MCA输出形状{y.shape}与输入{x.shape}不一致")
+#         return y
+        
 # v14.7
 # import math
 # import torch

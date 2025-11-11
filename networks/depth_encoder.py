@@ -473,6 +473,76 @@ class LGFI(nn.Module):
         # 残差
         x = identity + self.drop_path(x)
         return x
+
+# v 1.9.7,仅改一行self.mca = MCA(dim=dim, use_multiscale=True)
+# class LGFI(nn.Module):
+#     """
+#     Local-Global Feature Interaction with MCA (纯 4D 版)
+#     - 位置编码直接加在 (B,C,H,W)
+#     - 通道归一化用 channels_first
+#     - gamma 正确广播到 (1,C,1,1)
+#     - Inverted Bottleneck 仍走 channels_last 分支
+#     """
+#     def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6, expan_ratio=6,
+#                  use_pos_emb=True, num_heads=6, qkv_bias=True, attn_drop=0., drop=0.):
+#         super().__init__()
+#         self.dim = dim
+
+#         # 位置编码：(B,C,H,W)
+#         self.pos_embd = PositionalEncodingFourier(dim=self.dim) if use_pos_emb else None
+
+#         # 4D 注意力分支
+#         self.norm_mca = LayerNorm(self.dim, eps=1e-6, data_format="channels_first")
+#         self.gamma_mca = nn.Parameter(layer_scale_init_value * torch.ones(self.dim),
+#                                       requires_grad=True) if layer_scale_init_value > 0 else None
+#         self.mca = MCA(dim=dim, use_multiscale=True)
+
+#         # Inverted Bottleneck（channels_last）
+#         self.norm = LayerNorm(self.dim, eps=1e-6)   # channels_last
+#         self.pwconv1 = nn.Linear(self.dim, expan_ratio * self.dim)
+#         self.act = nn.GELU()
+#         self.pwconv2 = nn.Linear(expan_ratio * self.dim, self.dim)
+#         self.gamma = nn.Parameter(layer_scale_init_value * torch.ones(self.dim),
+#                                   requires_grad=True) if layer_scale_init_value > 0 else None
+
+#         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+#     def forward(self, x):
+#         # x: (B,C,H,W)
+#         identity = x
+#         B, C, H, W = x.shape
+
+#         # 位置编码
+#         if self.pos_embd is not None:
+#             x = x + self.pos_embd(B, H, W)  # (B,C,H,W)
+
+#         # 4D 注意力
+#         x_norm = self.norm_mca(x)
+#         y = self.mca(x_norm)  # (B,C,H,W)
+#         # 形状强校验（正常不会触发）
+#         if y.shape != x.shape:
+#             raise RuntimeError(f"LGFI: MCA 输出 {y.shape} 与输入 {x.shape} 不一致")
+
+#         # 按通道维广播 gamma
+#         if self.gamma_mca is not None:
+#             x = x + self.gamma_mca.view(1, -1, 1, 1) * y
+#         else:
+#             x = x + y
+
+#         # Inverted Bottleneck（与原版一致）
+#         x = x.permute(0, 2, 3, 1)          # (B,C,H,W) -> (B,H,W,C)
+#         x = self.norm(x)
+#         x = self.pwconv1(x)
+#         x = self.act(x)
+#         x = self.pwconv2(x)
+#         if self.gamma is not None:
+#             x = self.gamma * x             # (B,H,W,C)，沿 C 广播
+#         x = x.permute(0, 3, 1, 2)          # (B,H,W,C) -> (B,C,H,W)
+
+#         # 残差
+#         x = identity + self.drop_path(x)
+#         return x
+
 # v1.4.5  XCA长程为主，轻量化MCA（不含空间通道等）局部为辅
 # class LGFI(nn.Module):
 #     """
